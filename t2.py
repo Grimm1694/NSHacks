@@ -1,81 +1,69 @@
-import sounddevice as sd
-import numpy as np
-import requests
-import io
-import wave
-import tkinter as tk
-from tkinter import messagebox
-import threading
-from dotenv import load_dotenv
 import os
-load_dotenv()
+import asyncio
+import json
+import pyaudio
+import websockets
 
-HF_API_TOKEN = os.getenv("HF_API_TOKEN")
-API_URL = "https://api-inference.huggingface.co/models/openai/whisper-large-v3-turbo"
+# Read your Deepgram API key from the environment
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
+if not DEEPGRAM_API_KEY:
+    raise RuntimeError("Set DEEPGRAM_API_KEY in your environment")  # :contentReference[oaicite:0]{index=0}
 
-fraud_keywords = [
-    "otp", "one time password", "account number", "debit card",
-    "upi pin", "send money", "bank verification", "kyc update",
-    "government penalty", "block your account"
-]
+# Build the Deepgram WebSocket URL with query parameters
+# encoding=linear16, sample_rate=44100, channels=1, and punctuate=true for basic formatting
+DG_URL = (
+    "wss://api.deepgram.com/v1/listen"
+    f"?access_token={DEEPGRAM_API_KEY}"
+    "&encoding=linear16"
+    "&sample_rate=44100"
+    "&channels=1"
+    "&punctuate=true"
+)  # :contentReference[oaicite:1]{index=1}
 
-# Flag to control the recording loop5
-stop_flag = threading.Event()
+async def transcribe_live():
+    # Set up PyAudio for microphone capture
+    pa = pyaudio.PyAudio()
+    stream = pa.open(
+        format=pyaudio.paInt16,
+        channels=1,
+        rate=44100,
+        input=True,
+        frames_per_buffer=1024,
+    )
 
-def show_fraud_alert():
-    """Display a warning message when fraud is detected."""
-    root = tk.Tk()
-    root.withdraw()
-    messagebox.showwarning("⚠️ Fraud Detected!", "Suspicious conversation detected.\nCall has been halted.")
-    root.destroy()
+    async with websockets.connect(DG_URL) as ws:
+        print("🟢 Connected to Deepgram, start speaking…")
+        
+        async def send_audio():
+            try:
+                while True:
+                    data = stream.read(1024, exception_on_overflow=False)
+                    await ws.send(data)  # send raw PCM bytes
+            except websockets.ConnectionClosed:
+                pass
 
-def record_audio(duration=5, samplerate=16000):
-    """Record audio from the microphone for a given duration."""
-    print("🎙️ Recording...")
-    recording = sd.rec(int(duration * samplerate), samplerate=samplerate, channels=1, dtype='float32')
-    sd.wait()
-    # Convert the recording to a WAV format in memory
-    buffer = io.BytesIO()
-    with wave.open(buffer, 'wb') as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)  # 16-bit PCM
-        wf.setframerate(samplerate)
-        int16_audio = (recording * 32767).astype(np.int16)
-        wf.writeframes(int16_audio.tobytes())
-    buffer.seek(0)
-    return buffer
+        async def receive_transcripts():
+            try:
+                async for message in ws:
+                    res = json.loads(message)
+                    # ignore interim results unless you want them; only print finals
+                    if res.get("is_final"):
+                        transcript = res["channel"]["alternatives"][0]["transcript"]
+                        print(f"🗣  {transcript}")
+            except websockets.ConnectionClosed:
+                pass
 
-def transcribe_audio(buffer):
-    """Send the audio buffer to Hugging Face's API for transcription."""
-    headers = {
-        "Authorization": f"Bearer {HF_API_TOKEN}",
-        "Content-Type": "audio/wav"
-    }
-    print("📡 Sending audio to Hugging Face...")
-    response = requests.post(API_URL, headers=headers, data=buffer.read())
-    response.raise_for_status()
-    result = response.json()
-    return result.get('text', '').lower().strip()
+        # Run sending and receiving concurrently
+        await asyncio.gather(send_audio(), receive_transcripts())
 
-def fraud_detection(text):
-    """Check the transcribed text for any fraud-related keywords."""
-    print(f"📝 Transcribed Text: {text}")
-    for keyword in fraud_keywords:
-        if keyword in text:
-            print(f"🚨 FRAUD Detected (Keyword: {keyword.upper()})")
-            stop_flag.set()
-            show_fraud_alert()
-            break
-
-def listen_loop():
-    """Continuously record and process audio until a fraud keyword is detected."""
-    while not stop_flag.is_set():
-        buffer = record_audio(duration=5)
-        try:
-            text = transcribe_audio(buffer)
-            fraud_detection(text)
-        except Exception as e:
-            print(f"Error: {e}")
+    # Clean up
+    stream.stop_stream()
+    stream.close()
+    pa.terminate()
+    print("🔴 Connection closed")
 
 if __name__ == "__main__":
-    listen_loop()
+    try:
+        asyncio.run(transcribe_live())
+    except KeyboardInterrupt:
+        print("\nInterrupted by user, exiting…")
